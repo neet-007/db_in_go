@@ -180,10 +180,17 @@ func leafInsert(new BNode, old BNode, idx uint16, key []byte, val []byte) {
 }
 
 func leafUpdate(new BNode, old BNode, idx uint16, key []byte, val []byte) {
-	new.setHeader(BNODE_LEAF, old.nkeys()+1)
+	new.setHeader(BNODE_LEAF, old.nkeys())
+
 	nodeAppendRange(new, old, 0, 0, idx)
-	nodeAppendKV(new, idx, 0, key, val)
-	nodeAppendRange(new, old, idx+1, idx, old.nkeys()-idx)
+
+	if idx < old.nkeys() && bytes.Equal(old.getKey(idx), key) {
+		nodeAppendKV(new, idx, 0, key, val)
+	} else {
+		new.setHeader(BNODE_LEAF, old.nkeys()+1)
+		nodeAppendKV(new, idx, 0, key, val)
+		nodeAppendRange(new, old, idx+1, idx, old.nkeys()-idx)
+	}
 }
 
 func nodeReplaceKidN(tree *BTree, new BNode, old BNode, idx uint16, kids ...BNode) {
@@ -275,5 +282,133 @@ func treeInsert(tree *BTree, node BNode, key []byte, val []byte) BNode {
 		}
 	}
 
+	return new
+}
+
+func (tree *BTree) Insert(key []byte, val []byte) error {
+	if err := checkLimit(key, val); err != nil {
+		return err
+	}
+	if tree.root == 0 {
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+
+		root.setHeader(BNODE_LEAF, 2)
+		nodeAppendKV(root, 0, 0, nil, nil)
+		nodeAppendKV(root, 1, 0, key, val)
+
+		tree.root = tree.new(root)
+		return nil
+	}
+
+	node := treeInsert(tree, tree.get(tree.root), key, val)
+
+	nsplit, split := nodeSplit3(node)
+	tree.del(tree.root)
+	if nsplit > 1 {
+		root := BNode(make([]byte, BTREE_PAGE_SIZE))
+		root.setHeader(BNODE_NODE, nsplit)
+
+		for i, knode := range split[:nsplit] {
+			ptr, key := tree.new(knode), knode.getKey(0)
+
+			nodeAppendKV(root, uint16(i), ptr, key, nil)
+		}
+		tree.root = tree.new(root)
+	} else {
+		tree.root = tree.new(split[0])
+	}
+
+	return nil
+}
+
+func (tree *BTree) Delete(key []byte) (bool, error)
+
+// remove a key from a leaf node
+func leafDelete(new BNode, old BNode, idx uint16)
+
+// merge 2 nodes into 1
+func nodeMerge(new BNode, left BNode, right BNode)
+
+// replace 2 adjacent links with 1
+func nodeReplace2Kid(new BNode, old BNode, idx uint16, ptr uint64, key []byte)
+
+func shouldMerge(tree *BTree, node BNode, idx uint16, updated BNode) (int, BNode) {
+	if updated.nbytes() > BTREE_PAGE_SIZE/4 {
+		return 0, BNode{}
+	}
+
+	if idx > 0 {
+		sibiling := BNode(tree.get(node.getPtr(idx - 1)))
+		merged := sibiling.nbytes() + updated.nbytes() - HEADER
+
+		if merged <= BTREE_PAGE_SIZE {
+			return -1, sibiling
+		}
+	}
+
+	if idx+1 < node.nkeys() {
+		sibiling := BNode(tree.get(node.getPtr(idx + 1)))
+		merged := sibiling.nbytes() + updated.nbytes() - HEADER
+
+		if merged <= BTREE_PAGE_SIZE {
+			return 1, sibiling
+		}
+	}
+	return 0, BNode{}
+}
+
+func treeDelete(tree *BTree, node BNode, key []byte) BNode {
+	switch node.btype() {
+	case BNODE_LEAF:
+		{
+			leafDelete(node, node, 0)
+			return BNode{}
+		}
+	case BNODE_NODE:
+		{
+			return nodeDelete(tree, node, 0, []byte{})
+		}
+	default:
+		{
+			panic(fmt.Sprintf("node type does not match requiremnt %d", node.btype()))
+		}
+	}
+}
+
+func nodeDelete(tree *BTree, node BNode, idx uint16, key []byte) BNode {
+	kptr := node.getPtr(idx)
+	updated := treeDelete(tree, tree.get(kptr), key)
+	if len(updated) == 0 {
+		return BNode{}
+	}
+	tree.del(kptr)
+
+	new := BNode(make([]byte, BTREE_PAGE_SIZE))
+	mergeDir, sibling := shouldMerge(tree, node, idx, updated)
+	switch {
+	case mergeDir < 0:
+		{
+			merged := BNode(make([]byte, BTREE_PAGE_SIZE))
+			nodeMerge(merged, sibling, updated)
+			tree.del(node.getPtr(idx - 1))
+			nodeReplace2Kid(new, node, idx-1, tree.new(merged), merged.getKey(0))
+		}
+	case mergeDir > 0:
+		{
+			merged := BNode(make([]byte, BTREE_PAGE_SIZE))
+			nodeMerge(merged, updated, sibling)
+			tree.del(node.getPtr(idx + 1))
+			nodeReplace2Kid(new, node, idx, tree.new(merged), merged.getKey(0))
+		}
+	case mergeDir == 0 && updated.nkeys() == 0:
+		{
+			utils.Assert(node.nkeys() == 1 && idx == 0, fmt.Sprintf("node should have one key but has %d\n", node.nkeys()))
+			new.setHeader(BNODE_NODE, 0)
+		}
+	case mergeDir == 0 && updated.nkeys() > 0:
+		{
+			nodeReplaceKidN(tree, new, node, idx, updated)
+		}
+	}
 	return new
 }
